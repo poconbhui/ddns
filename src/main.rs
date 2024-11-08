@@ -2,31 +2,52 @@ use std::net::IpAddr;
 use std::rc::Rc;
 
 fn wan_ip() -> Result<IpAddr, String> {
-    let res = std::process::Command::new("dig")
-        .args([
-            "-4",
-            "TXT",
-            "+short",
-            "o-o.myaddr.l.google.com",
-            "@ns1.google.com",
-        ])
-        .output()
-        .map_err(|e| format!("Error running dig\n{:#?}", e))?;
+    // Get IP for ns1.google.com
+    let mut query = rustdns::Message::default();
+    query.add_question("ns1.google.com", rustdns::Type::A, rustdns::Class::Internet);
 
-    if res.status.success() {
-        let stdout = match std::str::from_utf8(&res.stdout) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("Error reading ip from dig: {:#?}", e)),
-        };
-        let ip = stdout.trim_matches(&['"', '\n']);
+    use rustdns::clients::Exchanger;
+    let ns1_ip = rustdns::clients::udp::Client::new("8.8.8.8:53")
+        .map_err(|e| format!("Error connecting to 8.8.8.8:53\n{:?}", e))?
+        .exchange(&query)
+        .map_err(|e| format!("Error exchanging dns query to 8.8.8.8:53\n{:?}", e))?
+        .answers
+        .into_iter()
+        .filter_map(|record| match record.resource {
+            rustdns::Resource::A(ip) => Some(ip),
+            _ => None,
+        })
+        .next()
+        .ok_or("No A record found for ns1.google.com".to_string())?;
 
-        use std::str::FromStr;
-        let ip = IpAddr::from_str(ip)
-            .map_err(|e| format!("Error parsing ip from dig: {}\n{:#?}", ip, e))?;
-        return Ok(ip);
-    } else {
-        return Err(format!("Error running dig\n{:#?}", res));
-    }
+    // Get TXT record for 0-0.myaddr.google.com from ns1.google.com
+    let mut query = rustdns::Message::default();
+    query.add_question(
+        "o-o.myaddr.1.google.com",
+        rustdns::Type::TXT,
+        rustdns::Class::Internet,
+    );
+
+    let res = rustdns::clients::udp::Client::new(format!("{}:53", ns1_ip))
+        .map_err(|e| format!("Error connecting to ns1.google.com\n{:?}", e))?
+        .exchange(&query)
+        .map_err(|e| format!("Error exchanging dns query to ns1.google.com\n{:?}", e))?
+        .answers
+        .into_iter()
+        .filter_map(|record| match record.resource {
+            rustdns::Resource::TXT(mut txt) => {
+                txt.0.pop().map(String::from_utf8).map(Result::ok).flatten()
+            }
+            _ => None,
+        })
+        .next()
+        .ok_or("No TXT record found for o-o.myaddr.1.google.com".to_string())?;
+
+    use std::str::FromStr;
+    let ip = IpAddr::from_str(&res)
+        .map_err(|e| format!("Error parsing ip from dig: {}\n{:#?}", res, e))?;
+
+    return Ok(ip);
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -74,12 +95,14 @@ fn get_cloudflare_ddns_records(config: &Config) -> Result<Vec<CloudflareDnsRecor
     Ok(ddns_records)
 }
 
-fn set_cloudflare_dns_records(dns_records: &Vec<CloudflareDnsRecord>, config: &Config) -> Result<(), String> {
+fn set_cloudflare_dns_records(
+    dns_records: &Vec<CloudflareDnsRecord>,
+    config: &Config,
+) -> Result<(), String> {
     for record in dns_records.iter() {
         ureq::put(&format!(
             "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
-            config.cloudflare_zone_id,
-            record.id
+            config.cloudflare_zone_id, record.id
         ))
         .set(
             "Authorization",
@@ -94,16 +117,14 @@ fn set_cloudflare_dns_records(dns_records: &Vec<CloudflareDnsRecord>, config: &C
     Ok(())
 }
 
-
 /// Update Cloudflare "ddns record" entries with WAN IP
 #[derive(clap::Parser, Debug)]
 #[command(version, about, long_about=None)]
 struct Args {
     /// Config file to read
     #[arg(long)]
-    config_dir: String
+    config_dir: String,
 }
-
 
 fn _main() -> Result<(), String> {
     use clap::Parser;
@@ -115,7 +136,7 @@ fn _main() -> Result<(), String> {
     if let Ok(s) = std::fs::read_to_string(wan_ip_file.clone()) {
         if *s == *wan_ip {
             println!("WAN IP unchanged {}", wan_ip);
-            return Ok(())
+            return Ok(());
         }
     }
     println!("Updating WAN IP {}", wan_ip);
@@ -125,7 +146,6 @@ fn _main() -> Result<(), String> {
         .map_err(|e| format!("error opening config file {}\n{:#?}", config_file, e))?;
     let config: Config = serde_json::from_reader(config_file_reader)
         .map_err(|e| format!("error parsing config file {}\n{:#?}", config_file, e))?;
-
 
     let mut ddns_records = get_cloudflare_ddns_records(&config)?;
     println!("\nDDNS records: {:#?}", ddns_records);
@@ -138,8 +158,12 @@ fn _main() -> Result<(), String> {
 
     set_cloudflare_dns_records(&ddns_records, &config)?;
 
-    std::fs::write(wan_ip_file.clone(), &*wan_ip)
-        .map_err(|e| format!("Error writing wan ip `{}` to file `{}`\n{}", wan_ip, wan_ip_file, e))?;
+    std::fs::write(wan_ip_file.clone(), &*wan_ip).map_err(|e| {
+        format!(
+            "Error writing wan ip `{}` to file `{}`\n{}",
+            wan_ip, wan_ip_file, e
+        )
+    })?;
 
     println!("\ndone");
 
