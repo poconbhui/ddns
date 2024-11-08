@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = { version = "4.5.20", features = ["derive"] }
+clap = { version = "4.5.20", features = ["derive", "std", "suggestions"], default-features = false }
 rustdns = { version = "0.4.0", default-features = false, features = ["udp"] }
-serde = { version = "1.0.214", features = ["derive", "rc"] }
-serde_json = "1.0.132"
-ureq = { version = "2.10.1", features = ["json"] }
+serde = { version = "1.0.214", features = ["derive", "rc"], default-features = false }
+serde_json = { version = "1.0.132", default-features = false }
+ureq = { version = "2.10.1", features = ["json", "tls"], default-features = false }
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = true
+codegen-units = 1
